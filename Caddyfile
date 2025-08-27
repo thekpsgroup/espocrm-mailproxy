@@ -1,0 +1,4 @@
+crm.thekpsgroup.com {
+  encode gzip
+  reverse_proxy espocrm-app:80
+}

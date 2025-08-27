@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  mail-proxy:
+    build: .
+    container_name: espocrm-mail-proxy
+    restart: unless-stopped
+    ports:
+      - "1993:1993"  # IMAP
+      - "1587:1587"  # SMTP
+      - "18089:18089"  # OAuth2 callback
+    volumes:
+      - ./config:/config
+      - mail_proxy_logs:/var/log
+    environment:
+      - NODE_ENV=production
+      - TZ=UTC
+    networks:
+      - espocrm-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18089/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Add monitoring with Prometheus/Grafana
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: espocrm-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - espocrm-network
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: espocrm-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - espocrm-network
+    profiles:
+      - monitoring
+
+networks:
+  espocrm-network:
+    external: true
+
+volumes:
+  mail_proxy_logs:
+  prometheus_data:
+  grafana_data:
