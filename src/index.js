@@ -306,8 +306,8 @@ function createIMAPProxy() {
     });
   });
 
-  imapServer.listen(1993, "127.0.0.1", () => {
-    console.log("📧 IMAP proxy listening on 127.0.0.1:1993");
+  imapServer.listen(1993, "0.0.0.0", () => {
+    console.log("📧 IMAP proxy listening on 0.0.0.0:1993");
   });
 
   return imapServer;
@@ -320,13 +320,17 @@ function createSMTPProxy() {
     
     let clientAuthenticated = false;
     let clientUsername = null;
+    let serverSocket = null;
+    let serverUpgraded = false;
+    let serverReady = false;
+    let pendingAuth = null; // { username }
     
-    // Connect to real SMTP server
-    const serverSocket = net.connect({
+    // Connect to real SMTP server (plaintext first; we'll upgrade with STARTTLS)
+    serverSocket = net.connect({
       host: serverSection.smtp_host,
       port: parseInt(serverSection.smtp_port)
     }, () => {
-      console.log("🔗 Connected to Microsoft SMTP server");
+      console.log("🔗 Connected to Microsoft SMTP server (plaintext)");
     });
 
     serverSocket.on("error", (err) => {
@@ -340,43 +344,155 @@ function createSMTPProxy() {
     });
 
     // Handle client -> server
+    let loginFlow = { waitingFor: null, username: null };
     clientSocket.on("data", (data) => {
-      const command = data.toString().trim();
+      const raw = data.toString();
+      const command = raw.trim();
       console.log("📤 SMTP Client -> Server:", command);
 
-      if (command.startsWith("AUTH LOGIN")) {
-        // Extract username and password (base64 values in one-line form)
-        const match = command.match(/AUTH LOGIN ([^\s]+) ([^\s]+)/);
-        if (match) {
-          const [, b64Username, b64Password] = match;
-          const decodedUsername = Buffer.from(b64Username, 'base64').toString('utf-8');
+      // Begin stepwise AUTH LOGIN (no args)
+      if (command.toUpperCase() === "AUTH LOGIN") {
+        loginFlow.waitingFor = 'username';
+        clientSocket.write("334 VXNlcm5hbWU6\r\n");
+        return;
+      }
+
+      // Username (base64) for stepwise flow
+      if (loginFlow.waitingFor === 'username') {
+        try {
+          const decodedUsername = Buffer.from(command, 'base64').toString('utf-8');
+          loginFlow.username = decodedUsername;
           clientUsername = decodedUsername;
-          
-          // Check tokens for the decoded username
-          const tokens = loadTokens(decodedUsername);
-          if (tokens && tokens.access_token) {
-            console.log("🔑 Using OAuth2 tokens for SMTP authentication");
-            
-            // Use OAuth2 authentication
-            const oauth2Command = `AUTH XOAUTH2 ${Buffer.from(`user=${decodedUsername}\x01auth=Bearer ${tokens.access_token}\x01\x01`).toString('base64')}\r\n`;
-            serverSocket.write(oauth2Command);
-            clientAuthenticated = true;
-          } else {
-            console.log("⚠️ No valid tokens found for SMTP");
-            clientSocket.write("535 Authentication failed - OAuth2 tokens required\r\n");
+          loginFlow.waitingFor = 'password';
+          clientSocket.write("334 UGFzc3dvcmQ6\r\n");
+          return;
+        } catch (e) {
+          clientSocket.write("535 Authentication failed\r\n");
+          loginFlow.waitingFor = null;
+          return;
+        }
+      }
+
+      // Password (base64) for stepwise flow → switch to XOAUTH2 upstream
+      if (loginFlow.waitingFor === 'password') {
+        const decodedUsername = loginFlow.username || clientUsername;
+        const tokens = loadTokens(decodedUsername);
+        if (!tokens || !tokens.access_token) {
+          console.log("⚠️ No valid tokens found for SMTP");
+          clientSocket.write("535 Authentication failed - OAuth2 tokens required\r\n");
+          loginFlow.waitingFor = null;
+          return;
+        }
+        const sendXOAUTH2 = () => {
+          console.log("🔑 Using OAuth2 tokens for SMTP authentication (XOAUTH2)");
+          const oauth2Command = `AUTH XOAUTH2 ${Buffer.from(`user=${decodedUsername}\x01auth=Bearer ${tokens.access_token}\x01\x01`).toString('base64')}\r\n`;
+          serverSocket.write(oauth2Command);
+          clientAuthenticated = true;
+        };
+        if (serverUpgraded) {
+          sendXOAUTH2();
+        } else {
+          pendingAuth = { username: decodedUsername, action: sendXOAUTH2 };
+        }
+        loginFlow.waitingFor = null;
+        return;
+      }
+
+      // One-line AUTH LOGIN with args
+      if (command.toUpperCase().startsWith("AUTH LOGIN ")) {
+        const match = command.match(/AUTH LOGIN ([^\s]+)(?:\s+[^\s]+)?/i);
+        if (match) {
+          const b64 = match[1];
+          let decodedUsername = '';
+          try { decodedUsername = Buffer.from(b64, 'base64').toString('utf-8'); } catch {}
+          if (decodedUsername) {
+            clientUsername = decodedUsername;
+            const tokens = loadTokens(decodedUsername);
+            if (!tokens || !tokens.access_token) {
+              console.log("⚠️ No valid tokens found for SMTP");
+              clientSocket.write("535 Authentication failed - OAuth2 tokens required\r\n");
+              return;
+            }
+            const sendXOAUTH2 = () => {
+              console.log("🔑 Using OAuth2 tokens for SMTP authentication (XOAUTH2)");
+              const oauth2Command = `AUTH XOAUTH2 ${Buffer.from(`user=${decodedUsername}\x01auth=Bearer ${tokens.access_token}\x01\x01`).toString('base64')}\r\n`;
+              serverSocket.write(oauth2Command);
+              clientAuthenticated = true;
+            };
+            if (serverUpgraded) {
+              sendXOAUTH2();
+            } else {
+              pendingAuth = { username: decodedUsername, action: sendXOAUTH2 };
+            }
             return;
           }
         }
-      } else {
-        // Forward other commands
-        serverSocket.write(data);
       }
+
+      // Default: forward to server
+      serverSocket.write(data);
     });
 
     // Handle server -> client
     serverSocket.on("data", (data) => {
       const response = data.toString();
       console.log("📥 SMTP Server -> Client:", response.trim());
+
+      // On initial banner, send EHLO
+      if (!serverReady && /^220 /.test(response)) {
+        serverSocket.write("EHLO local\r\n");
+        return;
+      }
+
+      // After EHLO, request STARTTLS if not yet upgraded
+      if (!serverUpgraded && response.startsWith("250") && /\bSTARTTLS\b/i.test(response)) {
+        serverSocket.write("STARTTLS\r\n");
+        return;
+      }
+
+      // Handle STARTTLS go-ahead
+      if (!serverUpgraded && /^220 /.test(response) && /SMTP server ready/i.test(response)) {
+        console.log("🔒 Upgrading SMTP connection with STARTTLS");
+        try {
+          const secured = tls.connect({
+            socket: serverSocket,
+            servername: serverSection.smtp_host,
+            rejectUnauthorized: false,
+          }, () => {
+            console.log("🔒 SMTP TLS established");
+            serverUpgraded = true;
+            secured.write("EHLO local\r\n");
+            // If client already asked to AUTH, send XOAUTH2 now
+            if (pendingAuth && typeof pendingAuth.action === 'function') {
+              pendingAuth.action();
+              pendingAuth = null;
+            }
+          });
+
+          // Rewire handlers to the secured socket
+          serverSocket.removeAllListeners('data');
+          serverSocket.on('error', () => {});
+          serverSocket = secured;
+          serverSocket.on('data', (d) => {
+            const resp = d.toString();
+            console.log("📥 SMTP(TLS) Server -> Client:", resp.trim());
+            clientSocket.write(d);
+          });
+          serverSocket.on('error', (e) => {
+            console.error("❌ SMTP TLS socket error:", e.message);
+            clientSocket.destroy();
+          });
+          serverSocket.on('close', () => {
+            console.log("🔗 SMTP server connection closed");
+            clientSocket.destroy();
+          });
+          return;
+        } catch (e) {
+          console.error("❌ STARTTLS upgrade failed:", e.message);
+        }
+      }
+
+      serverReady = true;
       clientSocket.write(data);
     });
 
@@ -391,8 +507,8 @@ function createSMTPProxy() {
     });
   });
 
-  smtpServer.listen(1587, "127.0.0.1", () => {
-    console.log("📤 SMTP proxy listening on 127.0.0.1:1587");
+  smtpServer.listen(1587, "0.0.0.0", () => {
+    console.log("📤 SMTP proxy listening on 0.0.0.0:1587");
   });
 
   return smtpServer;
