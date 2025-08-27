@@ -1,0 +1,17 @@
+services:
+  mail-proxy:
+    build: .
+    container_name: espocrm-mail-proxy
+    ports:
+      - "1993:1993"  # IMAP
+      - "1587:1587"  # SMTP
+      - "18089:18089"  # OAuth2 callback
+    volumes:
+      - ./config:/config
+    restart: unless-stopped
+    networks:
+      - espocrm-network
+
+networks:
+  espocrm-network:
+    external: true
