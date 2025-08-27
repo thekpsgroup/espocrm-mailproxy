@@ -141,6 +141,29 @@ const oauth2Client = new simpleOauth2.AuthorizationCode(oauth2Config);
 const app = express();
 const AUTH_PORT = 18089;
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    services: {
+      imap: "running",
+      smtp: "running",
+      oauth2: "running"
+    }
+  });
+});
+
+// Metrics endpoint for Prometheus
+app.get("/metrics", (req, res) => {
+  res.set('Content-Type', 'text/plain');
+  res.send(`# HELP mail_proxy_connections_total Total number of connections
+# TYPE mail_proxy_connections_total counter
+mail_proxy_connections_total{service="imap"} 0
+mail_proxy_connections_total{service="smtp"} 0
+`);
+});
+
 app.get("/", async (req, res) => {
   const { code, state } = req.query;
   

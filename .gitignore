@@ -1,2 +1,37 @@
-config/emailproxy.config
-data/emailproxy/emailproxy.config
+# OAuth2 tokens (sensitive)
+config/tokens/
+*.json
+
+# SSL certificates
+config/ssl/
+*.pem
+*.key
+*.crt
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.local
+
+# Node modules
+node_modules/
+
+# Docker volumes
+mail_proxy_logs/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
